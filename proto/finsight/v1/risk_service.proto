@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package finsight.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/SatyaChamana/FinSight/gen/go/finsight/v1;finsightv1";
+
+// RiskPredictionService serves portfolio risk metrics for a tenant.
+// Tenant identity is NOT in any request body; it is extracted from
+// gRPC metadata (API key) by the auth interceptor and propagated via
+// context.Context. Defense in depth: app-layer WHERE tenant_id +
+// Postgres RLS. See FINSIGHT_PROJECT_PLAN.md section 0F.
+service RiskPredictionService {
+  // PredictRisk returns VaR, CVaR and volatility for a portfolio.
+  rpc PredictRisk(PredictRiskRequest) returns (PredictRiskResponse);
+
+  // GetPortfolio returns the composition (assets and weights) of a portfolio.
+  rpc GetPortfolio(GetPortfolioRequest) returns (GetPortfolioResponse);
+
+  // GetModelInfo returns metadata about the currently loaded ONNX model.
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+}
+
+// PredictRiskRequest names a portfolio and overrides optional defaults.
+message PredictRiskRequest {
+  // Portfolio identifier scoped to the tenant.
+  string portfolio_id = 1;
+
+  // Lookback window in trading days. Optional. Default 63 (~3 months,
+  // one earnings cycle).
+  int32 lookback_days = 2;
+
+  // VaR/CVaR confidence level in [0, 1]. Optional. Default 0.95.
+  float confidence_level = 3;
+}
+
+// PredictRiskResponse carries the three risk targets and provenance.
+message PredictRiskResponse {
+  // Value at Risk at the requested confidence level. Expressed as a
+  // positive loss magnitude (e.g. 0.025 means a 2.5% expected daily loss).
+  float var_95 = 1;
+
+  // Conditional VaR (Expected Shortfall) at the requested confidence
+  // level. Average loss conditional on exceeding VaR.
+  float cvar_95 = 2;
+
+  // Annualized portfolio volatility (sigma * sqrt(252)).
+  float volatility = 3;
+
+  // Version of the ONNX model that produced this prediction. Used as
+  // part of the Redis cache key so reloads invalidate automatically.
+  string model_version = 4;
+
+  // Server clock at prediction time.
+  google.protobuf.Timestamp predicted_at = 5;
+
+  // Per-asset risk contribution. Keys are ticker symbols, values are
+  // the fraction of portfolio VaR attributable to each asset
+  // (contributions sum to ~1.0).
+  map<string, float> asset_contributions = 6;
+}
+
+// GetPortfolioRequest names a portfolio.
+message GetPortfolioRequest {
+  // Portfolio identifier scoped to the tenant.
+  string portfolio_id = 1;
+}
+
+// GetPortfolioResponse returns a portfolio's composition.
+message GetPortfolioResponse {
+  // Portfolio identifier.
+  string portfolio_id = 1;
+
+  // Human-readable name.
+  string name = 2;
+
+  // Assets in the portfolio with their weights.
+  repeated Asset assets = 3;
+
+  // Wall-clock time the portfolio was last modified.
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+// Asset is a single position in a portfolio.
+message Asset {
+  // Ticker symbol (e.g. "AAPL").
+  string symbol = 1;
+
+  // Portfolio weight in [0, 1]. Weights across all assets sum to 1.
+  float weight = 2;
+}
+
+// GetModelInfoRequest carries no parameters. The currently active
+// model is shared across all tenants.
+message GetModelInfoRequest {}
+
+// GetModelInfoResponse describes the loaded model.
+message GetModelInfoResponse {
+  // Semantic version of the model (e.g. "1.4.0").
+  string version = 1;
+
+  // Architecture description (e.g. "lstm+attention").
+  string architecture = 2;
+
+  // Time the model was loaded into memory.
+  google.protobuf.Timestamp loaded_at = 3;
+
+  // Hash of the model file for integrity checks.
+  string sha256 = 4;
+}
