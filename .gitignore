@@ -1,32 +1,113 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# ========================
+# Go
+# ========================
+bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
-
-# Code coverage profiles and other test artifacts
 *.out
 coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
+# Go workspace
 go.work
 go.work.sum
 
-# env file
-.env
+# Dependency directory (uncomment if vendoring)
+# vendor/
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# ========================
+# Python
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+ml/.venv/
+ml/venv/
+
+# Jupyter
+.ipynb_checkpoints/
+ml/notebooks/.ipynb_checkpoints/
+
+# PyTorch / ONNX model artifacts
+ml/models/*.onnx
+ml/models/*.pt
+ml/models/*.pth
+*.onnx
+*.pt
+*.pth
+
+# ========================
+# Terraform
+# ========================
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+crash.log
+
+# ========================
+# Docker
+# ========================
+docker-compose.override.yml
+
+# ========================
+# Environment / Secrets
+# ========================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ========================
+# IDE / Editor
+# ========================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ========================
+# Generated Code
+# ========================
+gen/
+
+# ========================
+# OS
+# ========================
+Thumbs.db
+.DS_Store
+
+# ========================
+# Misc
+# ========================
+tmp/
+*.log
+
+# ========================
+# Build artifacts
+# ========================
+graphify-out/
+ml/cache/
+ml/models/artifacts/
+ml/.ruff_cache/
+ml/.pytest_cache/
+ml/.python-version
