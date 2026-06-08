@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finsight-ml"
+version = "0.1.0"
+description = "FinSight ML pipeline: data, models, training, and ONNX export for portfolio risk prediction."
+requires-python = ">=3.12,<3.14"
+authors = [{ name = "Satya Chamana" }]
+license = { text = "Proprietary" }
+dependencies = [
+    "torch==2.12.0",
+    "numpy==2.4.6",
+    "pandas==3.0.3",
+    "scikit-learn==1.9.0",
+    "yfinance==1.4.1",
+    "onnx==1.21.0",
+    "onnxruntime==1.26.0",
+    "typer==0.26.7",
+    "pyarrow==24.0.0",
+    "joblib==1.5.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "ruff==0.15.16",
+    "black==26.5.1",
+]
+
+[project.scripts]
+finsight-ml = "cli:app"
+
+[tool.setuptools]
+py-modules = ["cli", "conftest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["data*", "models*", "training*", "export*"]
+exclude = ["tests*", "notebooks*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+# B008 forbids function calls in default args; typer relies on it heavily (typer.Option(...), typer.Argument(...)).
+# E501 is covered by formatter, no need to double-report.
+ignore = ["B008", "E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
