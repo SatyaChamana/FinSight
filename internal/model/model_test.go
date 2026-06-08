@@ -264,29 +264,32 @@ func TestNewEngineErrors(t *testing.T) {
 	}
 }
 
-func TestReadVersionFromManifest(t *testing.T) {
+func TestReadManifest(t *testing.T) {
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.onnx")
 	manifestPath := filepath.Join(dir, "model.manifest.json")
 
-	if err := os.WriteFile(manifestPath, []byte(`{"model_version":"9.9.9"}`), 0o600); err != nil {
+	if err := os.WriteFile(manifestPath, []byte(`{"model_version":"9.9.9","symbols":["AAA","BBB"]}`), 0o600); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
-	v, err := readVersionFromManifest(modelPath)
+	m, err := readManifest(modelPath)
 	if err != nil {
-		t.Fatalf("readVersionFromManifest: %v", err)
+		t.Fatalf("readManifest: %v", err)
 	}
-	if v != "9.9.9" {
-		t.Errorf("version = %q, want %q", v, "9.9.9")
+	if m.ModelVersion != "9.9.9" {
+		t.Errorf("version = %q, want %q", m.ModelVersion, "9.9.9")
+	}
+	if len(m.Symbols) != 2 || m.Symbols[0] != "AAA" || m.Symbols[1] != "BBB" {
+		t.Errorf("symbols = %v, want [AAA BBB]", m.Symbols)
 	}
 
-	// Missing manifest -> "unknown", no error.
-	v, err = readVersionFromManifest(filepath.Join(t.TempDir(), "model.onnx"))
+	// Missing manifest -> zero manifest, no error.
+	m, err = readManifest(filepath.Join(t.TempDir(), "model.onnx"))
 	if err != nil {
-		t.Fatalf("readVersionFromManifest (missing): %v", err)
+		t.Fatalf("readManifest (missing): %v", err)
 	}
-	if v != "unknown" {
-		t.Errorf("missing manifest version = %q, want %q", v, "unknown")
+	if m.ModelVersion != "" || m.Symbols != nil {
+		t.Errorf("missing manifest = %+v, want zero value", m)
 	}
 }
 

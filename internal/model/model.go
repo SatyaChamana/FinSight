@@ -73,10 +73,12 @@ type Config struct {
 	Version string
 }
 
-// manifest mirrors the fields we read from model.manifest.json. Only
-// ModelVersion is required here; the rest of the file is ignored.
+// manifest mirrors the fields we read from model.manifest.json. ModelVersion
+// and Symbols are the fields the engine surfaces; the rest of the file is
+// ignored here (the Go preprocessing already hardcodes the feature layout).
 type manifest struct {
-	ModelVersion string `json:"model_version"`
+	ModelVersion string   `json:"model_version"`
+	Symbols      []string `json:"symbols"`
 }
 
 // Engine owns the ONNX inference session and serves predictions. It is safe for
@@ -89,6 +91,7 @@ type Engine struct {
 
 	session   *ort.DynamicAdvancedSession
 	version   string
+	symbols   []string
 	modelPath string
 }
 
@@ -124,28 +127,26 @@ func initRuntime(libPath string) error {
 	return ortInitErr
 }
 
-// readVersionFromManifest looks for model.manifest.json next to the model file
-// and returns its model_version. If the manifest is missing it returns
-// "unknown" with no error (a missing manifest is not fatal). Malformed JSON is
-// reported as an error so the caller knows something is wrong.
-func readVersionFromManifest(modelPath string) (string, error) {
+// readManifest looks for model.manifest.json next to the model file and parses
+// it. If the manifest is missing it returns a zero manifest with no error (a
+// missing manifest is not fatal; the version then defaults to "unknown" and
+// symbols are empty). Malformed JSON is reported as an error so the caller
+// knows something is wrong.
+func readManifest(modelPath string) (manifest, error) {
 	manifestPath := filepath.Join(filepath.Dir(modelPath), "model.manifest.json")
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "unknown", nil
+			return manifest{}, nil
 		}
-		return "", fmt.Errorf("reading manifest %q: %w", manifestPath, err)
+		return manifest{}, fmt.Errorf("reading manifest %q: %w", manifestPath, err)
 	}
 
 	var m manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return "", fmt.Errorf("parsing manifest %q: %w", manifestPath, err)
+		return manifest{}, fmt.Errorf("parsing manifest %q: %w", manifestPath, err)
 	}
-	if m.ModelVersion == "" {
-		return "unknown", nil
-	}
-	return m.ModelVersion, nil
+	return m, nil
 }
 
 // newSession creates a DynamicAdvancedSession for the given model path. It
@@ -187,12 +188,16 @@ func NewEngine(ctx context.Context, cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("initializing ONNX runtime environment: %w", err)
 	}
 
+	m, err := readManifest(cfg.ModelPath)
+	if err != nil {
+		return nil, err
+	}
 	version := cfg.Version
 	if version == "" {
-		version, err = readVersionFromManifest(cfg.ModelPath)
-		if err != nil {
-			return nil, err
-		}
+		version = m.ModelVersion
+	}
+	if version == "" {
+		version = "unknown"
 	}
 
 	session, err := newSession(cfg.ModelPath)
@@ -203,6 +208,7 @@ func NewEngine(ctx context.Context, cfg Config) (*Engine, error) {
 	return &Engine{
 		session:   session,
 		version:   version,
+		symbols:   m.Symbols,
 		modelPath: cfg.ModelPath,
 	}, nil
 }
@@ -213,6 +219,21 @@ func (e *Engine) Version() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.version
+}
+
+// Symbols returns the ticker symbols the model was trained on, in the exact
+// column order the feature matrix must use (from the manifest). It may be empty
+// for older models whose manifest predates the symbols field. A copy is
+// returned so callers cannot mutate the engine's slice.
+func (e *Engine) Symbols() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.symbols) == 0 {
+		return nil
+	}
+	out := make([]string, len(e.symbols))
+	copy(out, e.symbols)
+	return out
 }
 
 // Close releases the ONNX session. The process-wide ONNX Runtime environment is

@@ -30,6 +30,7 @@ def write_manifest(
     scaler_path: Path | str | None,
     input_shape: tuple[int, ...],
     output_columns: tuple[str, ...],
+    symbols: list[str] | None = None,
 ) -> Path:
     """Write the JSON manifest next to the ONNX file.
 
@@ -45,6 +46,11 @@ def write_manifest(
         input_shape: Static input shape excluding batch, e.g. ``(63, 50)``.
         output_columns: Named outputs in the order they appear on the last
             axis of the model output, e.g. ``("volatility", "var_95", "cvar_95")``.
+        symbols: The ticker symbols the model was trained on, in the exact
+            order their per-symbol feature blocks are laid out along the input
+            feature axis. The Go inference path must order symbol blocks this
+            way (it is insertion order, not alphabetical), so this is required
+            for correct serving. ``None`` omits the field for older models.
 
     Returns:
         The resolved manifest path that was written.
@@ -59,6 +65,8 @@ def write_manifest(
         "input_shape": list(input_shape),
         "output_columns": list(output_columns),
     }
+    if symbols is not None:
+        payload["symbols"] = list(symbols)
 
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return out_path

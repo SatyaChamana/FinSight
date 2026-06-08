@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/SatyaChamana/FinSight/internal/inference"
+	"github.com/SatyaChamana/FinSight/internal/marketdata"
 	"github.com/SatyaChamana/FinSight/internal/model"
 	"github.com/SatyaChamana/FinSight/internal/server"
 	"github.com/SatyaChamana/FinSight/internal/service"
@@ -23,6 +24,7 @@ const (
 	defaultLogLevel  = "info"
 	defaultEnv       = "dev"
 	defaultModelPath = "ml/models/artifacts/model.onnx"
+	defaultBarsDir   = "data/bars"
 	modelArch        = "lstm+attention"
 	shutdownTimeout  = 10 * time.Second
 )
@@ -33,6 +35,7 @@ type config struct {
 	Env         string
 	DatabaseURL string
 	ModelPath   string
+	BarsDir     string
 }
 
 func loadConfig() config {
@@ -42,6 +45,7 @@ func loadConfig() config {
 		Env:         getEnv("ENV", defaultEnv),
 		DatabaseURL: getEnv("DATABASE_URL", ""),
 		ModelPath:   getEnv("MODEL_PATH", defaultModelPath),
+		BarsDir:     getEnv("BARS_DIR", defaultBarsDir),
 	}
 }
 
@@ -118,14 +122,16 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		// from. Without a DB, fall back to dummy PredictRisk but still
 		// report the loaded model version via GetModelInfo.
 		if portfolios != nil {
+			bars := marketdata.NewCSVBarStore(cfg.BarsDir)
 			predictor = service.NewRiskService(service.Options{
 				Portfolios: portfolios,
 				Scorer:     inference.NewScorer(engine),
-				Features:   inference.NewFeatureBuilder(),
+				Features:   inference.NewFeatureBuilder(bars, engine.Symbols()),
 				Logger:     logger,
 			})
 			logger.Info("model loaded; serving real predictions",
-				"version", modelVer, "model_path", cfg.ModelPath)
+				"version", modelVer, "model_path", cfg.ModelPath,
+				"symbols", engine.Symbols(), "bars_dir", cfg.BarsDir)
 		} else {
 			logger.Warn("model loaded but DATABASE_URL is unset; PredictRisk returns dummy values until a portfolio store is configured",
 				"version", modelVer, "model_path", cfg.ModelPath)

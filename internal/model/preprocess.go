@@ -85,9 +85,26 @@ type symbolFeatures struct {
 // position after each symbol's own warm-up rows are dropped, which matches the
 // Python result when all symbols share the same date axis.
 func BuildFeatureMatrix(symbolBars map[string][]OHLCV, weights map[string]float64) ([][]float32, error) {
-	symbols := sortedKeys(symbolBars)
+	return BuildFeatureMatrixOrdered(sortedKeys(symbolBars), symbolBars, weights)
+}
+
+// BuildFeatureMatrixOrdered is BuildFeatureMatrix with an explicit symbol
+// column order. The per-symbol blocks are laid out in `symbols` order, which
+// MUST match the order the model was trained with (the Python pipeline uses
+// list(weights.keys()) insertion order, not alphabetical). Use this when the
+// caller knows the training order; BuildFeatureMatrix sorts and is only safe
+// when the model is order-insensitive.
+func BuildFeatureMatrixOrdered(symbols []string, symbolBars map[string][]OHLCV, weights map[string]float64) ([][]float32, error) {
 	if len(symbols) != expectedSymbolCount {
 		return nil, fmt.Errorf("BuildFeatureMatrix expects %d symbols, got %d", expectedSymbolCount, len(symbols))
+	}
+	if len(symbolBars) != len(symbols) {
+		return nil, fmt.Errorf("symbolBars has %d symbols, order list has %d", len(symbolBars), len(symbols))
+	}
+	for _, s := range symbols {
+		if _, ok := symbolBars[s]; !ok {
+			return nil, fmt.Errorf("order list references symbol %q not in symbolBars", s)
+		}
 	}
 	if err := validateWeights(symbols, weights); err != nil {
 		return nil, err

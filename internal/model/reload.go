@@ -26,11 +26,15 @@ func (e *Engine) Reload(ctx context.Context, modelPath string) error {
 		return errors.New("model: Reload modelPath must not be empty")
 	}
 
-	// Resolve the new version before building the session so a bad manifest does
-	// not leave us with a session but no version.
-	newVersion, err := readVersionFromManifest(modelPath)
+	// Resolve the new manifest (version + symbols) before building the session so
+	// a bad manifest does not leave us with a session but no metadata.
+	m, err := readManifest(modelPath)
 	if err != nil {
 		return err
+	}
+	newVersion := m.ModelVersion
+	if newVersion == "" {
+		newVersion = "unknown"
 	}
 
 	// Build the new session outside the lock (this is the expensive step). The
@@ -45,6 +49,7 @@ func (e *Engine) Reload(ctx context.Context, modelPath string) error {
 	oldSess := e.session
 	e.session = newSess
 	e.version = newVersion
+	e.symbols = m.Symbols
 	e.modelPath = modelPath
 	e.mu.Unlock()
 

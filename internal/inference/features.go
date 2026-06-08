@@ -2,99 +2,98 @@ package inference
 
 import (
 	"context"
-	"hash/fnv"
-	"math"
+	"fmt"
+	"sort"
+	"strings"
 
+	"github.com/SatyaChamana/FinSight/internal/marketdata"
+	"github.com/SatyaChamana/FinSight/internal/model"
 	"github.com/SatyaChamana/FinSight/internal/service"
 	"github.com/SatyaChamana/FinSight/internal/store"
 )
 
-const (
-	// lookbackRows and featureCols match the exported ONNX model input
-	// shape [63, 49] (see ml/models/artifacts/model.manifest.json).
-	lookbackRows = 63
-	featureCols  = 49
-)
-
-// FeatureBuilder produces the [63][49] model input from a portfolio.
+// FeatureBuilder turns a portfolio into the model's [63][49] input by loading
+// real OHLCV history for each holding and running the Python-parity feature
+// pipeline (model.BuildFeatureMatrixOrdered).
 //
-// NOTE (Phase 5 gap): FinSight has no OHLCV price-history data source
-// yet. The store holds portfolio composition only (symbols and weights),
-// not market bars. model.BuildFeatureMatrix is the real, Python-parity
-// feature pipeline, but it requires per-symbol OHLCV history we cannot
-// supply here.
-//
-// Until a price-history store lands, this builder synthesizes a
-// deterministic feature matrix seeded from the portfolio so that:
-//  1. inference runs end to end against the real ONNX model, and
-//  2. the same portfolio always yields the same features, which keeps
-//     the prediction cache stable (model_version + portfolio_id key).
-//
-// Replace this with an OHLCV-backed builder that calls
-// model.BuildFeatureMatrix once market data is wired (a later phase).
-type FeatureBuilder struct{}
+// The model is shared and was trained on one fixed symbol universe in a fixed
+// column order (engine.Symbols()). The per-symbol feature blocks must be laid
+// out in that exact order, which is insertion order from training, NOT
+// alphabetical. This builder therefore imposes the model's symbol order
+// regardless of how the store returns the portfolio's assets, and rejects
+// portfolios whose holdings fall outside the model's trained universe (a shared
+// single-portfolio model cannot meaningfully score arbitrary holdings).
+type FeatureBuilder struct {
+	bars    marketdata.BarReader
+	symbols []string // model's trained symbol order (column layout)
+}
 
 // compile-time check that *FeatureBuilder satisfies service.FeatureBuilder.
 var _ service.FeatureBuilder = (*FeatureBuilder)(nil)
 
-// NewFeatureBuilder constructs the placeholder feature builder.
-func NewFeatureBuilder() *FeatureBuilder {
-	return &FeatureBuilder{}
+// NewFeatureBuilder constructs a builder over a bar source and the model's
+// trained symbol order (from engine.Symbols()).
+func NewFeatureBuilder(bars marketdata.BarReader, symbols []string) *FeatureBuilder {
+	return &FeatureBuilder{bars: bars, symbols: symbols}
 }
 
-// BuildFeatures returns a deterministic [63][49] matrix and the asset
-// weight map. lookbackDays is accepted for interface compatibility but
-// the model input is fixed at 63 rows, so it is not used to resize.
-func (b *FeatureBuilder) BuildFeatures(_ context.Context, p *store.Portfolio, _ int) ([][]float32, map[string]float64, error) {
+// BuildFeatures loads bars for each model symbol, builds the feature matrix in
+// the model's column order, and returns it with the portfolio's weight map.
+// lookbackDays is accepted for interface compatibility but the model input is
+// fixed at 63 rows.
+func (b *FeatureBuilder) BuildFeatures(ctx context.Context, p *store.Portfolio, _ int) ([][]float32, map[string]float64, error) {
+	if len(b.symbols) == 0 {
+		return nil, nil, fmt.Errorf("feature builder: model exposes no symbol metadata; cannot order feature columns")
+	}
+	if err := checkUniverse(b.symbols, p.Assets); err != nil {
+		return nil, nil, err
+	}
+
 	weights := make(map[string]float64, len(p.Assets))
 	for _, a := range p.Assets {
 		weights[a.Symbol] = a.Weight
 	}
 
-	seed := seedFor(p)
-	matrix := make([][]float32, lookbackRows)
-	for i := range matrix {
-		row := make([]float32, featureCols)
-		for j := range row {
-			row[j] = pseudoFeature(seed, i, j)
+	symbolBars := make(map[string][]model.OHLCV, len(b.symbols))
+	for _, sym := range b.symbols {
+		bars, err := b.bars.Bars(ctx, sym)
+		if err != nil {
+			return nil, nil, fmt.Errorf("loading bars for %q: %w", sym, err)
 		}
-		matrix[i] = row
+		symbolBars[sym] = bars
 	}
-	return matrix, weights, nil
+
+	features, err := model.BuildFeatureMatrixOrdered(b.symbols, symbolBars, weights)
+	if err != nil {
+		return nil, nil, fmt.Errorf("building feature matrix: %w", err)
+	}
+	return features, weights, nil
 }
 
-// seedFor derives a stable uint64 seed from the portfolio identity and
-// composition, so the same portfolio always produces the same features.
-func seedFor(p *store.Portfolio) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(p.ID))
-	for _, a := range p.Assets {
-		_, _ = h.Write([]byte(a.Symbol))
-		// fold the weight in so re-weighting changes the features.
-		bits := math.Float64bits(a.Weight)
-		var buf [8]byte
-		for k := 0; k < 8; k++ {
-			buf[k] = byte(bits >> (8 * k))
-		}
-		_, _ = h.Write(buf[:])
+// checkUniverse verifies the portfolio holds exactly the model's symbol set.
+func checkUniverse(modelSymbols []string, assets []store.Asset) error {
+	if len(assets) != len(modelSymbols) {
+		return fmt.Errorf(
+			"portfolio has %d holdings but the model serves %d symbols [%s]",
+			len(assets), len(modelSymbols), strings.Join(modelSymbols, ", "),
+		)
 	}
-	return h.Sum64()
-}
-
-// pseudoFeature produces a small bounded deterministic value in roughly
-// [-0.05, 0.05], resembling the scale of returns and volatilities the
-// model was trained on. It is a cheap SplitMix64-style mix of the seed
-// and cell coordinates, not real market data.
-func pseudoFeature(seed uint64, row, col int) float32 {
-	x := seed
-	x ^= uint64(row+1) * 0x9E3779B97F4A7C15
-	x ^= uint64(col+1) * 0xC2B2AE3D27D4EB4F
-	x ^= x >> 30
-	x *= 0xBF58476D1CE4E5B9
-	x ^= x >> 27
-	x *= 0x94D049BB133111EB
-	x ^= x >> 31
-	// map the top 53 bits to [0, 1), then to [-0.05, 0.05].
-	unit := float64(x>>11) / float64(uint64(1)<<53)
-	return float32((unit - 0.5) * 0.1)
+	want := make(map[string]bool, len(modelSymbols))
+	for _, s := range modelSymbols {
+		want[s] = true
+	}
+	missing := make([]string, 0)
+	for _, a := range assets {
+		if !want[a.Symbol] {
+			missing = append(missing, a.Symbol)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf(
+			"portfolio holdings [%s] are outside the model's trained universe [%s]",
+			strings.Join(missing, ", "), strings.Join(modelSymbols, ", "),
+		)
+	}
+	return nil
 }

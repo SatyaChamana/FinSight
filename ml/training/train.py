@@ -226,6 +226,7 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         scaler_path=None,
         input_shape=(cfg.lookback_days, dataset.feature_dim),
         output_columns=tuple(model.output_columns),
+        symbols=list(cfg.symbols),
     )
     print(f"      wrote manifest to {cfg.artifacts_dir / 'model.manifest.json'}")
 
