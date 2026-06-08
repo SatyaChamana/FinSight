@@ -7,6 +7,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
+	github.com/yalue/onnxruntime_go v1.31.0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
 )

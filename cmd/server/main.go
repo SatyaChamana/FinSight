@@ -11,15 +11,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SatyaChamana/FinSight/internal/inference"
+	"github.com/SatyaChamana/FinSight/internal/model"
 	"github.com/SatyaChamana/FinSight/internal/server"
+	"github.com/SatyaChamana/FinSight/internal/service"
 	"github.com/SatyaChamana/FinSight/internal/store"
 )
 
 const (
-	defaultPort     = "9090"
-	defaultLogLevel = "info"
-	defaultEnv      = "dev"
-	shutdownTimeout = 10 * time.Second
+	defaultPort      = "9090"
+	defaultLogLevel  = "info"
+	defaultEnv       = "dev"
+	defaultModelPath = "ml/models/artifacts/model.onnx"
+	modelArch        = "lstm+attention"
+	shutdownTimeout  = 10 * time.Second
 )
 
 type config struct {
@@ -27,6 +32,7 @@ type config struct {
 	LogLevel    slog.Level
 	Env         string
 	DatabaseURL string
+	ModelPath   string
 }
 
 func loadConfig() config {
@@ -35,6 +41,7 @@ func loadConfig() config {
 		LogLevel:    parseLogLevel(getEnv("LOG_LEVEL", defaultLogLevel)),
 		Env:         getEnv("ENV", defaultEnv),
 		DatabaseURL: getEnv("DATABASE_URL", ""),
+		ModelPath:   getEnv("MODEL_PATH", defaultModelPath),
 	}
 }
 
@@ -88,6 +95,43 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		logger.Warn("DATABASE_URL is unset; portfolio RPCs will return Unavailable")
 	}
 
+	// Load the ONNX model and build the prediction service. If the model
+	// (or its runtime) cannot be loaded, log a warning and continue: the
+	// server still serves with dummy PredictRisk values so local dev and
+	// machines without the ONNX Runtime shared library are not blocked.
+	var predictor server.Predictor
+	modelVer := ""
+	engine, err := model.NewEngine(ctx, model.Config{ModelPath: cfg.ModelPath})
+	if err != nil {
+		logger.Warn("model not loaded; PredictRisk will return dummy values",
+			"model_path", cfg.ModelPath,
+			"err", err,
+		)
+	} else {
+		defer func() {
+			if closeErr := engine.Close(); closeErr != nil {
+				logger.Warn("model engine close failed", "err", closeErr)
+			}
+		}()
+		modelVer = engine.Version()
+		// Real predictions need a portfolio store to read composition
+		// from. Without a DB, fall back to dummy PredictRisk but still
+		// report the loaded model version via GetModelInfo.
+		if portfolios != nil {
+			predictor = service.NewRiskService(service.Options{
+				Portfolios: portfolios,
+				Scorer:     inference.NewScorer(engine),
+				Features:   inference.NewFeatureBuilder(),
+				Logger:     logger,
+			})
+			logger.Info("model loaded; serving real predictions",
+				"version", modelVer, "model_path", cfg.ModelPath)
+		} else {
+			logger.Warn("model loaded but DATABASE_URL is unset; PredictRisk returns dummy values until a portfolio store is configured",
+				"version", modelVer, "model_path", cfg.ModelPath)
+		}
+	}
+
 	addr := ":" + cfg.Port
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -95,9 +139,12 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	}
 
 	srv := server.New(server.Options{
-		Logger:           logger,
-		Portfolios:       portfolios,
-		EnableReflection: cfg.Env != "prod",
+		Logger:            logger,
+		Portfolios:        portfolios,
+		Predictor:         predictor,
+		ModelVersion:      modelVer,
+		ModelArchitecture: modelArch,
+		EnableReflection:  cfg.Env != "prod",
 	})
 
 	serverErr := make(chan error, 1)
