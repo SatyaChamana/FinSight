@@ -23,6 +23,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	finsightv1 "github.com/SatyaChamana/FinSight/gen/go/finsight/v1"
+	"github.com/SatyaChamana/FinSight/internal/service"
 	"github.com/SatyaChamana/FinSight/internal/store"
 	"github.com/SatyaChamana/FinSight/internal/tenant"
 )
@@ -44,6 +45,14 @@ type PortfolioReader interface {
 	GetPortfolioWithAssets(ctx context.Context, portfolioID string) (*store.Portfolio, error)
 }
 
+// Predictor is the prediction orchestration the PredictRisk handler
+// depends on. Defined here (where it is consumed); *service.RiskService
+// satisfies it. When nil, PredictRisk falls back to dummy dev values so
+// the server still runs without a loaded model.
+type Predictor interface {
+	PredictRisk(ctx context.Context, portfolioID string, lookbackDays int, confidenceLevel float64) (*service.Prediction, error)
+}
+
 // RiskService implements finsightv1.RiskPredictionServiceServer.
 // It embeds the unimplemented base so forward-compatible RPCs added
 // to the proto do not break the build until they are implemented.
@@ -51,24 +60,94 @@ type RiskService struct {
 	finsightv1.UnimplementedRiskPredictionServiceServer
 	logger     *slog.Logger
 	portfolios PortfolioReader
+	predictor  Predictor
+	modelVer   string
+	modelArch  string
 	now        func() time.Time
 }
 
 // NewRiskService constructs a RiskService. The portfolio reader may be
 // nil in unit tests that exercise PredictRisk only; GetPortfolio will
-// then return Unavailable.
-func NewRiskService(logger *slog.Logger, portfolios PortfolioReader) *RiskService {
-	return &RiskService{logger: logger, portfolios: portfolios, now: time.Now}
+// then return Unavailable. The predictor may be nil; PredictRisk then
+// returns dummy dev values. Empty modelVer/modelArch fall back to dummy
+// metadata in GetModelInfo.
+func NewRiskService(logger *slog.Logger, portfolios PortfolioReader, predictor Predictor, modelVer, modelArch string) *RiskService {
+	if modelVer == "" {
+		modelVer = dummyModelVersion
+	}
+	if modelArch == "" {
+		modelArch = dummyModelArchitecture
+	}
+	return &RiskService{
+		logger:     logger,
+		portfolios: portfolios,
+		predictor:  predictor,
+		modelVer:   modelVer,
+		modelArch:  modelArch,
+		now:        time.Now,
+	}
 }
 
-// PredictRisk returns dummy VaR/CVaR/volatility. Tenant id is read
-// from context (set by the tenant interceptor); we log it but do not
-// persist yet (predictions table comes online in Phase 5).
+// PredictRisk serves a risk prediction. When a predictor is wired it
+// runs real ONNX inference through the service layer; otherwise it falls
+// back to dummy dev values so the server is usable without a model.
+// Tenant id is enforced by the interceptor and read here for logging.
 func (s *RiskService) PredictRisk(ctx context.Context, req *finsightv1.PredictRiskRequest) (*finsightv1.PredictRiskResponse, error) {
 	tenantID, err := tenant.FromContext(ctx)
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
+
+	if s.predictor == nil {
+		return s.predictRiskDummy(ctx, tenantID, req)
+	}
+
+	pred, err := s.predictor.PredictRisk(
+		ctx,
+		req.GetPortfolioId(),
+		int(req.GetLookbackDays()),
+		float64(req.GetConfidenceLevel()),
+	)
+	if err != nil {
+		return nil, s.mapPredictError(ctx, err)
+	}
+
+	contribs := make(map[string]float32, len(pred.AssetContributions))
+	for sym, v := range pred.AssetContributions {
+		contribs[sym] = float32(v)
+	}
+
+	return &finsightv1.PredictRiskResponse{
+		Var_95:             float32(pred.VaR95),
+		Cvar_95:            float32(pred.CVaR95),
+		Volatility:         float32(pred.Volatility),
+		ModelVersion:       pred.ModelVersion,
+		PredictedAt:        timestamppb.New(pred.PredictedAt),
+		AssetContributions: contribs,
+	}, nil
+}
+
+// mapPredictError translates service-layer sentinel errors into gRPC
+// status codes. gRPC code mapping lives only in the server package.
+func (s *RiskService) mapPredictError(ctx context.Context, err error) error {
+	switch {
+	case errors.Is(err, service.ErrInvalidPortfolioID):
+		return status.Error(codes.InvalidArgument, "portfolio_id is required")
+	case errors.Is(err, service.ErrInvalidConfidence):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, service.ErrPortfolioNotFound):
+		return status.Error(codes.NotFound, "portfolio not found")
+	case errors.Is(err, tenant.ErrMissing):
+		return status.Error(codes.Unauthenticated, err.Error())
+	default:
+		s.logger.ErrorContext(ctx, "PredictRisk failed", "err", err)
+		return status.Error(codes.Internal, "prediction failed")
+	}
+}
+
+// predictRiskDummy is the no-model dev fallback. It validates inputs the
+// same way the service layer would and returns fixed values.
+func (s *RiskService) predictRiskDummy(ctx context.Context, tenantID string, req *finsightv1.PredictRiskRequest) (*finsightv1.PredictRiskResponse, error) {
 	if req.GetPortfolioId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "portfolio_id is required")
 	}
@@ -85,7 +164,7 @@ func (s *RiskService) PredictRisk(ctx context.Context, req *finsightv1.PredictRi
 		return nil, status.Errorf(codes.InvalidArgument, "confidence_level must be < 1, got %f", confidence)
 	}
 
-	s.logger.DebugContext(ctx, "PredictRisk",
+	s.logger.DebugContext(ctx, "PredictRisk (dummy, no model loaded)",
 		"tenant_id", tenantID,
 		"portfolio_id", req.GetPortfolioId(),
 		"lookback_days", lookback,
@@ -96,7 +175,7 @@ func (s *RiskService) PredictRisk(ctx context.Context, req *finsightv1.PredictRi
 		Var_95:       0.0250,
 		Cvar_95:      0.0420,
 		Volatility:   0.1850,
-		ModelVersion: dummyModelVersion,
+		ModelVersion: s.modelVer,
 		PredictedAt:  timestamppb.New(s.now()),
 		AssetContributions: map[string]float32{
 			"AAPL": 0.40,
@@ -150,8 +229,8 @@ func (s *RiskService) GetPortfolio(ctx context.Context, req *finsightv1.GetPortf
 // model is shared across all tenants.
 func (s *RiskService) GetModelInfo(_ context.Context, _ *finsightv1.GetModelInfoRequest) (*finsightv1.GetModelInfoResponse, error) {
 	return &finsightv1.GetModelInfoResponse{
-		Version:      dummyModelVersion,
-		Architecture: dummyModelArchitecture,
+		Version:      s.modelVer,
+		Architecture: s.modelArch,
 		LoadedAt:     timestamppb.New(s.now()),
 		Sha256:       "0000000000000000000000000000000000000000000000000000000000000000",
 	}, nil
@@ -159,9 +238,12 @@ func (s *RiskService) GetModelInfo(_ context.Context, _ *finsightv1.GetModelInfo
 
 // Options configures the gRPC server.
 type Options struct {
-	Logger           *slog.Logger
-	Portfolios       PortfolioReader
-	EnableReflection bool
+	Logger            *slog.Logger
+	Portfolios        PortfolioReader
+	Predictor         Predictor
+	ModelVersion      string
+	ModelArchitecture string
+	EnableReflection  bool
 }
 
 // requiresTenant returns true for RPCs that must carry an
@@ -207,7 +289,7 @@ func New(opts Options) *grpc.Server {
 		grpc.UnaryInterceptor(selectiveTenantUnary()),
 		grpc.StreamInterceptor(selectiveTenantStream()),
 	)
-	finsightv1.RegisterRiskPredictionServiceServer(srv, NewRiskService(logger, opts.Portfolios))
+	finsightv1.RegisterRiskPredictionServiceServer(srv, NewRiskService(logger, opts.Portfolios, opts.Predictor, opts.ModelVersion, opts.ModelArchitecture))
 
 	hc := health.NewServer()
 	hc.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)

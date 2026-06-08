@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -18,6 +19,7 @@ import (
 
 	finsightv1 "github.com/SatyaChamana/FinSight/gen/go/finsight/v1"
 	"github.com/SatyaChamana/FinSight/internal/server"
+	"github.com/SatyaChamana/FinSight/internal/service"
 	"github.com/SatyaChamana/FinSight/internal/store"
 )
 
@@ -43,19 +45,39 @@ func (f *fakePortfolioReader) GetPortfolioWithAssets(_ context.Context, portfoli
 	return p, nil
 }
 
+// fakePredictor is a hand-rolled server.Predictor for testing the real
+// (non-dummy) PredictRisk delegation path and error mapping.
+type fakePredictor struct {
+	pred *service.Prediction
+	err  error
+}
+
+func (f *fakePredictor) PredictRisk(_ context.Context, _ string, _ int, _ float64) (*service.Prediction, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.pred, nil
+}
+
 // newTestServer spins up the gRPC server over an in-memory bufconn
 // listener and returns a client connection. The server and connection
 // are torn down by t.Cleanup.
 func newTestServer(t *testing.T, reader server.PortfolioReader) *grpc.ClientConn {
 	t.Helper()
-
-	lis := bufconn.Listen(bufSize)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := server.New(server.Options{
-		Logger:           logger,
+	return newTestServerWith(t, server.Options{
 		Portfolios:       reader,
 		EnableReflection: false,
 	})
+}
+
+// newTestServerWith spins up the server with caller-supplied Options,
+// filling in a discard logger and a bufconn listener.
+func newTestServerWith(t *testing.T, opts server.Options) *grpc.ClientConn {
+	t.Helper()
+
+	lis := bufconn.Listen(bufSize)
+	opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := server.New(opts)
 
 	go func() {
 		if err := srv.Serve(lis); err != nil {
@@ -131,6 +153,80 @@ func TestPredictRisk_ReturnsDummyValues(t *testing.T) {
 	}
 	if len(resp.GetAssetContributions()) == 0 {
 		t.Error("AssetContributions is empty")
+	}
+}
+
+func TestPredictRisk_DelegatesToPredictor(t *testing.T) {
+	want := &service.Prediction{
+		VaR95:        0.031,
+		CVaR95:       0.052,
+		Volatility:   0.21,
+		ModelVersion: "0.1.0",
+		PredictedAt:  time.Unix(1_700_000_000, 0).UTC(),
+		AssetContributions: map[string]float64{
+			"AAPL": 0.018,
+			"MSFT": 0.013,
+		},
+	}
+	conn := newTestServerWith(t, server.Options{Predictor: &fakePredictor{pred: want}})
+	client := finsightv1.NewRiskPredictionServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(withTenant(context.Background(), testTenantID), 2*time.Second)
+	defer cancel()
+
+	resp, err := client.PredictRisk(ctx, &finsightv1.PredictRiskRequest{PortfolioId: "p-1"})
+	if err != nil {
+		t.Fatalf("PredictRisk: %v", err)
+	}
+	if resp.GetVar_95() != float32(want.VaR95) {
+		t.Errorf("Var_95: got %f, want %f", resp.GetVar_95(), float32(want.VaR95))
+	}
+	if resp.GetCvar_95() != float32(want.CVaR95) {
+		t.Errorf("Cvar_95: got %f, want %f", resp.GetCvar_95(), float32(want.CVaR95))
+	}
+	if resp.GetVolatility() != float32(want.Volatility) {
+		t.Errorf("Volatility: got %f, want %f", resp.GetVolatility(), float32(want.Volatility))
+	}
+	if resp.GetModelVersion() != want.ModelVersion {
+		t.Errorf("ModelVersion: got %q, want %q", resp.GetModelVersion(), want.ModelVersion)
+	}
+	if got := resp.GetAssetContributions(); len(got) != 2 || got["AAPL"] != 0.018 {
+		t.Errorf("AssetContributions: got %v", got)
+	}
+	if !resp.GetPredictedAt().AsTime().Equal(want.PredictedAt) {
+		t.Errorf("PredictedAt: got %v, want %v", resp.GetPredictedAt().AsTime(), want.PredictedAt)
+	}
+}
+
+func TestPredictRisk_MapsServiceErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		wantErr codes.Code
+	}{
+		{"invalid portfolio id", service.ErrInvalidPortfolioID, codes.InvalidArgument},
+		{"invalid confidence", service.ErrInvalidConfidence, codes.InvalidArgument},
+		{"portfolio not found", service.ErrPortfolioNotFound, codes.NotFound},
+		{"unexpected error", errors.New("boom"), codes.Internal},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := newTestServerWith(t, server.Options{Predictor: &fakePredictor{err: tc.err}})
+			client := finsightv1.NewRiskPredictionServiceClient(conn)
+
+			ctx, cancel := context.WithTimeout(withTenant(context.Background(), testTenantID), 2*time.Second)
+			defer cancel()
+
+			_, err := client.PredictRisk(ctx, &finsightv1.PredictRiskRequest{PortfolioId: "p-1"})
+			st, ok := status.FromError(err)
+			if !ok {
+				t.Fatalf("error is not a gRPC status: %v", err)
+			}
+			if st.Code() != tc.wantErr {
+				t.Errorf("code: got %v, want %v", st.Code(), tc.wantErr)
+			}
+		})
 	}
 }
 
