@@ -19,12 +19,14 @@ Differences from training/train.py (the single-portfolio teaching run):
 Reuses the exact feature pipeline (PortfolioRiskDataset, compute_features,
 compute_portfolio_features) so Go-side parity is preserved.
 
-Run from ml/:  PYTHONPATH=. .venv/bin/python -m training.train_large [--smoke]
+Run from ml/:  PYTHONPATH=. .venv/bin/python -m training.train_large
+Quick pipeline check (tiny run to /tmp):  add --smoke, or set SMOKE=1.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -373,11 +375,20 @@ def _smoke(cfg: LargeTrainConfig) -> LargeTrainConfig:
     return cfg
 
 
+def _smoke_requested(flag: bool) -> bool:
+    """Smoke mode is on via the --smoke flag OR a truthy SMOKE env var
+    (SMOKE=1/true/yes), so both invocation styles work."""
+    if flag:
+        return True
+    return os.getenv("SMOKE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true", help="tiny fast run to validate the pipeline")
     args = ap.parse_args()
     config = LargeTrainConfig()
-    if args.smoke:
+    if _smoke_requested(args.smoke):
+        print("SMOKE mode: tiny fast run")
         config = _smoke(config)
     _train(config)
