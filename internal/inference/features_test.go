@@ -45,19 +45,60 @@ func TestBuildFeatures_RejectsWrongCount(t *testing.T) {
 	}
 }
 
-func TestBuildFeatures_RejectsNoSymbolMetadata(t *testing.T) {
-	b := NewFeatureBuilder(fakeBars{}, nil)
-	p := &store.Portfolio{ID: "x", Assets: []store.Asset{{Symbol: "AAPL", Weight: 1.0}}}
-	if _, _, err := b.BuildFeatures(context.Background(), p, 63); err == nil {
-		t.Fatal("want error when model has no symbol metadata, got nil")
+// genBars is a BarReader that synthesizes a deterministic, varying OHLCV series
+// per symbol so every feature is finite. Used to exercise the generalized path
+// without the ONNX runtime.
+type genBars struct{ n int }
+
+func (g genBars) Bars(_ context.Context, sym string) ([]model.OHLCV, error) {
+	var seed float64
+	for _, c := range sym {
+		seed += float64(c)
+	}
+	bars := make([]model.OHLCV, g.n)
+	price := 100.0 + seed/10.0
+	for i := 0; i < g.n; i++ {
+		drift := math.Sin(float64(i)/7.0+seed) * 0.5
+		price *= 1.0 + drift/100.0
+		open := price * (1.0 + math.Cos(float64(i)+seed)/200.0)
+		bars[i] = model.OHLCV{
+			Open: open, High: price * 1.01, Low: price * 0.99,
+			Close: price, AdjClose: price, Volume: 1e6,
+		}
+	}
+	return bars, nil
+}
+
+func TestBuildFeatures_GeneralizedPath(t *testing.T) {
+	// nil model symbols => generalized model: any 5-asset portfolio is accepted
+	// and laid out in sorted symbol order.
+	b := NewFeatureBuilder(genBars{n: 200}, nil)
+	p := &store.Portfolio{
+		ID: "mix",
+		Assets: []store.Asset{
+			{Symbol: "MSFT", Weight: 0.3}, {Symbol: "AAPL", Weight: 0.1},
+			{Symbol: "GOOG", Weight: 0.2}, {Symbol: "AMZN", Weight: 0.2},
+			{Symbol: "META", Weight: 0.2},
+		},
+	}
+	features, weights, err := b.BuildFeatures(context.Background(), p, 63)
+	if err != nil {
+		t.Fatalf("BuildFeatures (generalized): %v", err)
+	}
+	if len(features) != 63 || len(features[0]) != 49 {
+		t.Fatalf("feature dims: got %dx%d, want 63x49", len(features), len(features[0]))
+	}
+	if len(weights) != 5 || weights["MSFT"] != 0.3 {
+		t.Errorf("weights mismatch: %v", weights)
 	}
 }
 
-// TestBuildFeatures_TrueNumbers is the end-to-end regression lock: the real
-// ONNX engine, the committed OHLCV in data/bars, and the feature builder must
-// reproduce the Python ground-truth prediction for the trained portfolio.
-// Values verified against ml onnxruntime on 2025-12-30 data (see the Python
-// reference: volatility 0.268855, var_95 0.065819, cvar_95 0.037074).
+// TestBuildFeatures_TrueNumbers is the end-to-end regression lock for the
+// generalized v1.0.0 model: the real ONNX engine, the committed OHLCV in
+// data/bars, and the feature builder must reproduce the Python onnxruntime
+// ground truth for two distinct portfolios (verified on 2025-12-30 data). It
+// also asserts the heads are internally consistent (CVaR >= VaR) and that the
+// two portfolios produce different risk, which the generalized model should.
 func TestBuildFeatures_TrueNumbers(t *testing.T) {
 	const (
 		modelPath = "../../ml/models/artifacts/model.onnx"
@@ -76,46 +117,68 @@ func TestBuildFeatures_TrueNumbers(t *testing.T) {
 	}
 	defer func() { _ = engine.Close() }()
 
-	b := NewFeatureBuilder(marketdata.NewCSVBarStore(barsDir), engine.Symbols())
-	// Assets intentionally alphabetical; the builder must reorder to training order.
-	p := &store.Portfolio{
-		ID: "flagship",
-		Assets: []store.Asset{
-			{Symbol: "AAPL", Weight: 0.2}, {Symbol: "AMZN", Weight: 0.2},
-			{Symbol: "GOOG", Weight: 0.2}, {Symbol: "META", Weight: 0.2},
-			{Symbol: "MSFT", Weight: 0.2},
+	bars := marketdata.NewCSVBarStore(barsDir)
+	// engine.Symbols() is nil for the generalized model; the builder then orders
+	// the portfolio's own holdings (sorted). Assets passed unsorted on purpose.
+	b := NewFeatureBuilder(bars, engine.Symbols())
+
+	cases := []struct {
+		name                       string
+		assets                     []store.Asset
+		wantVol, wantVar, wantCVaR float64
+	}{
+		{
+			name: "tech",
+			assets: []store.Asset{
+				{Symbol: "MSFT", Weight: 0.2}, {Symbol: "AAPL", Weight: 0.2},
+				{Symbol: "GOOG", Weight: 0.2}, {Symbol: "AMZN", Weight: 0.2},
+				{Symbol: "META", Weight: 0.2},
+			},
+			wantVol: 0.200801, wantVar: 0.033842, wantCVaR: 0.034701,
+		},
+		{
+			name: "financials",
+			assets: []store.Asset{
+				{Symbol: "JPM", Weight: 0.2}, {Symbol: "BAC", Weight: 0.2},
+				{Symbol: "GS", Weight: 0.2}, {Symbol: "MS", Weight: 0.2},
+				{Symbol: "C", Weight: 0.2},
+			},
+			wantVol: 0.167625, wantVar: 0.026204, wantCVaR: 0.026657,
 		},
 	}
 
-	features, weights, err := b.BuildFeatures(context.Background(), p, 63)
-	if err != nil {
-		t.Fatalf("BuildFeatures: %v", err)
-	}
-	if len(features) != 63 || len(features[0]) != 49 {
-		t.Fatalf("feature dims: got %dx%d, want 63x49", len(features), len(features[0]))
-	}
-	if len(weights) != 5 || weights["AAPL"] != 0.2 {
-		t.Errorf("weights mismatch: %v", weights)
-	}
-
-	pred, err := engine.Predict(context.Background(), features, weights)
-	if err != nil {
-		t.Fatalf("Predict: %v", err)
-	}
-
 	const tol = 1e-4
-	checks := []struct {
-		name string
-		got  float64
-		want float64
-	}{
-		{"volatility", pred.Volatility, 0.268855},
-		{"var_95", pred.VaR95, 0.065819},
-		{"cvar_95", pred.CVaR95, 0.037074},
-	}
-	for _, c := range checks {
-		if math.Abs(c.got-c.want) > tol {
-			t.Errorf("%s: got %.6f, want %.6f (tol %g)", c.name, c.got, c.want, tol)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			features, weights, err := b.BuildFeatures(context.Background(), &store.Portfolio{ID: tc.name, Assets: tc.assets}, 63)
+			if err != nil {
+				t.Fatalf("BuildFeatures: %v", err)
+			}
+			if len(features) != 63 || len(features[0]) != 49 {
+				t.Fatalf("feature dims: got %dx%d, want 63x49", len(features), len(features[0]))
+			}
+			if len(weights) != 5 {
+				t.Errorf("weights len: got %d, want 5", len(weights))
+			}
+			pred, err := engine.Predict(context.Background(), features, weights)
+			if err != nil {
+				t.Fatalf("Predict: %v", err)
+			}
+			for _, c := range []struct {
+				metric    string
+				got, want float64
+			}{
+				{"volatility", pred.Volatility, tc.wantVol},
+				{"var_95", pred.VaR95, tc.wantVar},
+				{"cvar_95", pred.CVaR95, tc.wantCVaR},
+			} {
+				if math.Abs(c.got-c.want) > tol {
+					t.Errorf("%s: got %.6f, want %.6f (tol %g)", c.metric, c.got, c.want, tol)
+				}
+			}
+			if pred.CVaR95 < pred.VaR95 {
+				t.Errorf("CVaR (%.6f) < VaR (%.6f): heads inconsistent", pred.CVaR95, pred.VaR95)
+			}
+		})
 	}
 }

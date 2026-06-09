@@ -14,8 +14,8 @@ func TestReloadSameModel(t *testing.T) {
 	defer func() { _ = eng.Close() }()
 
 	before := eng.Version()
-	if before != "0.1.0" {
-		t.Fatalf("Version before reload = %q, want %q", before, "0.1.0")
+	if before == "" || before == "unknown" {
+		t.Fatalf("Version before reload = %q, want a real version from the manifest", before)
 	}
 
 	if err := eng.Reload(context.Background(), testModelPath); err != nil {

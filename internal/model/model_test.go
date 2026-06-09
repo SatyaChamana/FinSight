@@ -65,8 +65,8 @@ func TestPredictGolden(t *testing.T) {
 		}
 	}()
 
-	if got := eng.Version(); got != "0.1.0" {
-		t.Errorf("Version = %q, want %q", got, "0.1.0")
+	if got := eng.Version(); got == "" || got == "unknown" {
+		t.Errorf("Version = %q, want a real version from the manifest", got)
 	}
 
 	features := constantFeatures(0.01)
@@ -90,8 +90,8 @@ func TestPredictGolden(t *testing.T) {
 		}
 	}
 
-	if pred.ModelVersion != "0.1.0" {
-		t.Errorf("ModelVersion = %q, want %q", pred.ModelVersion, "0.1.0")
+	if pred.ModelVersion != eng.Version() {
+		t.Errorf("ModelVersion = %q, want engine version %q", pred.ModelVersion, eng.Version())
 	}
 
 	// AssetContributions should sum to approximately VaR95.

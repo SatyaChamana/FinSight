@@ -16,16 +16,22 @@ import (
 // real OHLCV history for each holding and running the Python-parity feature
 // pipeline (model.BuildFeatureMatrixOrdered).
 //
-// The model is shared and was trained on one fixed symbol universe in a fixed
-// column order (engine.Symbols()). The per-symbol feature blocks must be laid
-// out in that exact order, which is insertion order from training, NOT
-// alphabetical. This builder therefore imposes the model's symbol order
-// regardless of how the store returns the portfolio's assets, and rejects
-// portfolios whose holdings fall outside the model's trained universe (a shared
-// single-portfolio model cannot meaningfully score arbitrary holdings).
+// It supports two kinds of model:
+//
+//   - Specific-universe model (symbols non-empty, from engine.Symbols()): the
+//     model was trained on one fixed 5-symbol portfolio in a fixed column
+//     order. The builder imposes that exact order and rejects portfolios whose
+//     holdings fall outside the trained universe.
+//
+//   - Generalized model (symbols empty: the manifest omits the symbols field):
+//     the model was trained on many sampled portfolios with shuffled column
+//     order, so it scores any 5-asset portfolio. The builder accepts the
+//     portfolio's own holdings and lays them out in a deterministic order
+//     (sorted, matching the store's ORDER BY symbol), as long as bar data is
+//     available for each.
 type FeatureBuilder struct {
 	bars    marketdata.BarReader
-	symbols []string // model's trained symbol order (column layout)
+	symbols []string // trained symbol order, or empty for a generalized model
 }
 
 // compile-time check that *FeatureBuilder satisfies service.FeatureBuilder.
@@ -42,20 +48,26 @@ func NewFeatureBuilder(bars marketdata.BarReader, symbols []string) *FeatureBuil
 // lookbackDays is accepted for interface compatibility but the model input is
 // fixed at 63 rows.
 func (b *FeatureBuilder) BuildFeatures(ctx context.Context, p *store.Portfolio, _ int) ([][]float32, map[string]float64, error) {
-	if len(b.symbols) == 0 {
-		return nil, nil, fmt.Errorf("feature builder: model exposes no symbol metadata; cannot order feature columns")
-	}
-	if err := checkUniverse(b.symbols, p.Assets); err != nil {
-		return nil, nil, err
-	}
-
 	weights := make(map[string]float64, len(p.Assets))
 	for _, a := range p.Assets {
 		weights[a.Symbol] = a.Weight
 	}
 
-	symbolBars := make(map[string][]model.OHLCV, len(b.symbols))
-	for _, sym := range b.symbols {
+	// Decide the column order. A specific-universe model dictates the order and
+	// restricts the holdings; a generalized model accepts the portfolio's own
+	// holdings in a deterministic (sorted) order.
+	var order []string
+	if len(b.symbols) > 0 {
+		if err := checkUniverse(b.symbols, p.Assets); err != nil {
+			return nil, nil, err
+		}
+		order = b.symbols
+	} else {
+		order = sortedSymbols(p.Assets)
+	}
+
+	symbolBars := make(map[string][]model.OHLCV, len(order))
+	for _, sym := range order {
 		bars, err := b.bars.Bars(ctx, sym)
 		if err != nil {
 			return nil, nil, fmt.Errorf("loading bars for %q: %w", sym, err)
@@ -63,11 +75,22 @@ func (b *FeatureBuilder) BuildFeatures(ctx context.Context, p *store.Portfolio, 
 		symbolBars[sym] = bars
 	}
 
-	features, err := model.BuildFeatureMatrixOrdered(b.symbols, symbolBars, weights)
+	features, err := model.BuildFeatureMatrixOrdered(order, symbolBars, weights)
 	if err != nil {
 		return nil, nil, fmt.Errorf("building feature matrix: %w", err)
 	}
 	return features, weights, nil
+}
+
+// sortedSymbols returns the portfolio's symbols in ascending order (matching the
+// store's ORDER BY symbol), used as the column order for a generalized model.
+func sortedSymbols(assets []store.Asset) []string {
+	out := make([]string, len(assets))
+	for i, a := range assets {
+		out[i] = a.Symbol
+	}
+	sort.Strings(out)
+	return out
 }
 
 // checkUniverse verifies the portfolio holds exactly the model's symbol set.
