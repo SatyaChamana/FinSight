@@ -82,6 +82,7 @@ class LargeTrainConfig:
     batch_size: int = 256
     epochs: int = 80
     patience: int = 8
+    select_loss_round: int = 4  # val-loss buckets for the selection tie-break
     learning_rate: float = 1e-3
     grad_clip_norm: float = 1.0
     weight_decay: float = 1e-5
@@ -262,7 +263,13 @@ def _train(cfg: LargeTrainConfig) -> dict[str, object]:
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="min", factor=0.5, patience=3)
 
     n = len(Xtr)
+    # Selection key is (bucketed val loss, cvar<var fraction): among epochs whose
+    # val loss rounds to the same bucket (a near-tie), the one with the fewest
+    # CVaR<VaR violations wins. A clearly lower bucket still wins outright. This
+    # avoids exporting a marginally-lower-loss model that has worse head ordering.
+    best_key: tuple[float, float] | None = None
     best_val = float("inf")
+    best_viol = 1.0
     best_state: dict[str, torch.Tensor] | None = None
     no_improve = 0
     history: list[dict[str, float]] = []
@@ -301,14 +308,20 @@ def _train(cfg: LargeTrainConfig) -> dict[str, object]:
             f"cvar<var={viol*100:.1f}%)"
         )
 
-        if val_total < best_val - 1e-5:
+        key = (round(val_total, cfg.select_loss_round), viol)
+        if best_key is None or key < best_key:
+            best_key = key
             best_val = val_total
+            best_viol = viol
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             no_improve = 0
         else:
             no_improve += 1
             if no_improve >= cfg.patience:
-                print(f"      early stop at epoch {epoch} (best val {best_val:.5f})")
+                print(
+                    f"      early stop at epoch {epoch} "
+                    f"(selected val {best_val:.5f}, cvar<var {best_viol*100:.1f}%)"
+                )
                 break
     train_time = time.time() - t0
 
@@ -351,7 +364,8 @@ def _train(cfg: LargeTrainConfig) -> dict[str, object]:
         "val_windows": int(val_mask.sum()),
         "epochs_run": len(history),
         "best_val": round(best_val, 6),
-        "final_cvar_lt_var_frac": history[-1]["cvar_lt_var_frac"],
+        "selected_cvar_lt_var_frac": round(best_viol, 6),
+        "final_epoch_cvar_lt_var_frac": history[-1]["cvar_lt_var_frac"],
         "train_time_seconds": round(train_time, 1),
         "parity": parity,
         "device": str(device),

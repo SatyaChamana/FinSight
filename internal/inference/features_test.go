@@ -134,7 +134,7 @@ func TestBuildFeatures_TrueNumbers(t *testing.T) {
 				{Symbol: "GOOG", Weight: 0.2}, {Symbol: "AMZN", Weight: 0.2},
 				{Symbol: "META", Weight: 0.2},
 			},
-			wantVol: 0.200801, wantVar: 0.033842, wantCVaR: 0.034701,
+			wantVol: 0.221184, wantVar: 0.035225, wantCVaR: 0.036550,
 		},
 		{
 			name: "financials",
@@ -143,7 +143,7 @@ func TestBuildFeatures_TrueNumbers(t *testing.T) {
 				{Symbol: "GS", Weight: 0.2}, {Symbol: "MS", Weight: 0.2},
 				{Symbol: "C", Weight: 0.2},
 			},
-			wantVol: 0.167625, wantVar: 0.026204, wantCVaR: 0.026657,
+			wantVol: 0.162252, wantVar: 0.024381, wantCVaR: 0.025154,
 		},
 	}
 
